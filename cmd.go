@@ -61,6 +61,7 @@ type Cmd struct {
 	Name   string
 	Args   []string
 	Env    []string
+	Dir    string
 	Stdout chan string // streaming STDOUT if enabled, else nil (see Options)
 	Stderr chan string // streaming STDERR if enabled, else nil (see Options)
 	*sync.Mutex
@@ -201,7 +202,7 @@ func (c *Cmd) Stop() error {
 	// Signal the process group (-pid), not just the process, so that the process
 	// and all its children are signaled. Else, child procs can keep running and
 	// keep the stdout/stderr fd open and cause cmd.Wait to hang.
-	return terminateProcess(c.status.PID)
+	return syscall.Kill(-c.status.PID, syscall.SIGTERM)
 }
 
 // Status returns the Status of the command at any time. It is safe to call
@@ -273,8 +274,10 @@ func (c *Cmd) run() {
 	// //////////////////////////////////////////////////////////////////////
 	cmd := exec.Command(c.Name, c.Args...)
 
-	// Platform-specific SysProcAttr management
-	setProcessGroupID(cmd)
+	// Set process group ID so the cmd and all its children become a new
+	// process group. This allows Stop to SIGTERM the cmd's process group
+	// without killing this process (i.e. this code here).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	// Write stdout and stderr to buffers that are safe to read while writing
 	// and don't cause a race condition.
@@ -290,15 +293,20 @@ func (c *Cmd) run() {
 		c.stderr = NewOutputBuffer()
 		cmd.Stdout = c.stdout
 		cmd.Stderr = c.stderr
-	} else {
+	} else if c.Stdout != nil {
 		// Streaming only
 		cmd.Stdout = NewOutputStream(c.Stdout)
 		cmd.Stderr = NewOutputStream(c.Stderr)
+	} else {
+		// No output (effectively >/dev/null 2>&1)
+		cmd.Stdout = nil
+		cmd.Stderr = nil
 	}
 
 	// Set the runtime environment for the command as per os/exec.Cmd.  If Env
 	// is nil, use the current process' environment.
 	cmd.Env = c.Env
+	cmd.Dir = c.Dir
 
 	// //////////////////////////////////////////////////////////////////////
 	// Start command
